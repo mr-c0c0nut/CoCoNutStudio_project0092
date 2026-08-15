@@ -488,57 +488,48 @@ def cmd_check(args, ctx):
 
 
 # ==================================================================
-# RUN COMMAND — rewritten
+# RUN / DISCOVERY
 # ==================================================================
 
-# Matches https://github.com/owner/repo (with or without trailing slash,
-# .git suffix, or extra path segments after the repo name).
 GITHUB_RE_FULL = re.compile(
     r"^https?://(?:www\.)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/"
     r"([A-Za-z0-9._-]+?)(?:\.git)?(?:/.*)?$"
 )
-# Matches owner/repo shorthand only (no scheme, no extra slashes/segments).
 GITHUB_RE_SHORT = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)$"
 )
 
-ENTRY_POINT_CANDIDATES = [
-    "app.py", "main.py", "index.py", "package.json", "requirements.txt",
-]
+# Case-insensitive entry point candidates, in priority order per language.
+PY_ENTRY_CANDIDATES = ["app.py", "main.py", "run.py", "index.py"]
+NODE_ENTRY_CANDIDATES = ["server.js", "index.js", "app.js"]
+WEB_ENTRY_CANDIDATES = ["index.html"]
+
+MARKER_FILES = ["requirements.txt", "package.json", "runtime.txt", "procfile", "readme.md"]
+
+MAX_TREE_ITEMS_SHOWN = 40
 
 
 def _parse_repo_ref(ref: str):
-    """Return (owner, repo) or None. Explicitly rejects raw.githubusercontent.com
-    and any other host — only github.com URLs or bare 'owner/repo' shorthand
-    are supported in v0.1, per spec."""
     ref = ref.strip()
     if not ref:
         return None
-
     m = GITHUB_RE_FULL.match(ref)
     if m:
         return m.group(1), m.group(2)
-
-    # If it looks like a URL but isn't a github.com one, reject explicitly
-    # rather than falling through to the shorthand pattern.
     if re.match(r"^https?://", ref):
         return None
-
     m = GITHUB_RE_SHORT.match(ref)
     if m:
         return m.group(1), m.group(2)
-
     return None
 
 
-def _github_get(url, timeout=GITHUB_TIMEOUT):
-    """Single point of contact with the GitHub API. Never swallows the
-    real exception — logs it with app.logger.exception so Render Logs
-    shows the actual cause, then raises a specific CommandError."""
+def _github_get(url, timeout=GITHUB_TIMEOUT, params=None):
     try:
         return requests.get(
             url,
             timeout=timeout,
+            params=params,
             headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "MCO-Terminal",
@@ -559,42 +550,119 @@ def _github_get(url, timeout=GITHUB_TIMEOUT):
         raise CommandError("GitHub connection failed.") from e
 
 
-def _detect_entry_point(owner, repo, default_branch):
-    """Look at the repo's root tree and return the first matching common
-    entry-point filename, or None. Failures here are non-fatal — RUN
-    still reports repository info even if the tree lookup fails."""
-    tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}"
+def _fetch_repo_tree(owner, repo, default_branch):
+    """Fetch the recursive tree (single API call) and return the raw
+    list of tree items, or [] on any non-fatal failure. Discovery must
+    never fail the whole RUN command just because the tree is unreadable."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}"
     try:
         resp = requests.get(
-            tree_url,
+            url,
             timeout=GITHUB_TIMEOUT,
+            params={"recursive": "1"},
             headers={
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "MCO-Terminal",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-    except requests.exceptions.RequestException as e:
-        app.logger.exception("GitHub tree lookup failed | owner=%s repo=%s", owner, repo)
-        return None
+    except requests.exceptions.RequestException:
+        app.logger.exception("GitHub tree fetch failed | owner=%s repo=%s", owner, repo)
+        return []
 
     if resp.status_code != 200:
-        return None
+        app.logger.error(
+            "GitHub tree fetch non-200 | owner=%s repo=%s status=%s", owner, repo, resp.status_code
+        )
+        return []
 
     try:
-        tree = resp.json().get("tree", [])
+        body = resp.json()
     except ValueError:
-        app.logger.exception("GitHub tree response was not valid JSON | owner=%s repo=%s", owner, repo)
-        return None
+        app.logger.exception("GitHub tree response not valid JSON | owner=%s repo=%s", owner, repo)
+        return []
 
-    names_at_root = {
-        item.get("path") for item in tree
-        if isinstance(item, dict) and item.get("type") == "blob" and "/" not in (item.get("path") or "")
-    }
-    for candidate in ENTRY_POINT_CANDIDATES:
-        if candidate in names_at_root:
-            return candidate
+    return body.get("tree", []) if isinstance(body, dict) else []
+
+
+def _build_project_tree_lines(tree_items):
+    """Render a shallow, readable tree: root-level files plus top-level
+    directories (marked with a trailing slash), sorted dirs-last-alpha
+    then files-alpha, capped to keep output terminal-friendly."""
+    root_files = []
+    root_dirs = set()
+
+    for item in tree_items:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path") or ""
+        item_type = item.get("type")
+        if not path:
+            continue
+        if "/" not in path:
+            if item_type == "blob":
+                root_files.append(path)
+            elif item_type == "tree":
+                root_dirs.add(path)
+        else:
+            root_dirs.add(path.split("/", 1)[0])
+
+    entries = sorted(root_files, key=str.lower) + [d + "/" for d in sorted(root_dirs, key=str.lower)]
+    truncated = len(entries) > MAX_TREE_ITEMS_SHOWN
+    entries = entries[:MAX_TREE_ITEMS_SHOWN]
+
+    lines = []
+    for i, entry in enumerate(entries):
+        is_last = (i == len(entries) - 1) and not truncated
+        branch = "└── " if is_last else "├── "
+        lines.append(branch + entry)
+    if truncated:
+        lines.append("└── ... (truncated)")
+    return lines
+
+
+def _find_ci(names_lower_map, candidates):
+    """Case-insensitive lookup: return the ORIGINAL filename as it
+    appears in the repo for the first matching candidate, or None."""
+    for candidate in candidates:
+        original = names_lower_map.get(candidate.lower())
+        if original:
+            return original
     return None
+
+
+def _detect_project(tree_items):
+    """Inspect root-level blobs (case-insensitively) and determine
+    entry point, project type, and dependency marker file."""
+    names_lower_map = {}
+    for item in tree_items:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path") or ""
+        if item.get("type") == "blob" and "/" not in path:
+            names_lower_map[path.lower()] = path
+
+    entry = None
+    project_type = None
+
+    py_entry = _find_ci(names_lower_map, PY_ENTRY_CANDIDATES)
+    node_entry = _find_ci(names_lower_map, NODE_ENTRY_CANDIDATES)
+    has_package_json = "package.json" in names_lower_map
+    web_entry = _find_ci(names_lower_map, WEB_ENTRY_CANDIDATES)
+
+    if py_entry:
+        entry, project_type = py_entry, "Python"
+    elif node_entry or has_package_json:
+        entry = node_entry or names_lower_map.get("package.json")
+        project_type = "Node.js"
+    elif web_entry:
+        entry, project_type = web_entry, "Web (static HTML)"
+
+    dependencies = _find_ci(names_lower_map, MARKER_FILES[:2])  # requirements.txt / package.json
+    if not dependencies:
+        dependencies = _find_ci(names_lower_map, MARKER_FILES)
+
+    return entry, project_type, dependencies
 
 
 def cmd_run(args, ctx):
@@ -617,7 +685,7 @@ def cmd_run(args, ctx):
 
     if resp.status_code == 404:
         return [
-            "[ M.C.O / RUN ]", "",
+            "[ M.C.O / RUN / DISCOVERY ]", "",
             f"Repository : {owner}/{repo}",
             "Status     : NOT FOUND", "",
             "Repository not found.",
@@ -637,28 +705,35 @@ def cmd_run(args, ctx):
         raise CommandError("GitHub connection failed.") from e
 
     default_branch = info.get("default_branch") or "main"
-    description = (info.get("description") or "(no description)")[:200]
-    visibility = "PRIVATE" if info.get("private") else "PUBLIC"
-    html_url = info.get("html_url") or f"https://github.com/{owner}/{repo}"
 
-    entry = _detect_entry_point(owner, repo, default_branch)
+    tree_items = _fetch_repo_tree(owner, repo, default_branch)
+    tree_lines = _build_project_tree_lines(tree_items) if tree_items else []
+    entry, project_type, dependencies = _detect_project(tree_items) if tree_items else (None, None, None)
 
     lines = [
-        "[ M.C.O / RUN ]", "",
+        "[ M.C.O / RUN / DISCOVERY ]", "",
         f"Repository : {owner}/{repo}",
         "Status     : FOUND",
-        f"Owner      : {owner}",
-        f"Description: {description}",
         f"Branch     : {default_branch}",
-        f"Visibility : {visibility}",
-        f"URL        : {html_url}",
-        f"Entry      : {entry if entry else '(none of the common entry points found)'}",
         "",
-        "Execution:",
-        "SANDBOX REQUIRED",
-        "NOT AVAILABLE IN V0.1 — SAFE PLACEHOLDER",
-        "(Repository code is never downloaded or executed by M.C.O.)",
     ]
+
+    if tree_lines:
+        lines.append("Project tree:")
+        lines.extend(tree_lines)
+        lines.append("")
+    else:
+        lines.append("Project tree: (unavailable — could not read repository contents)")
+        lines.append("")
+
+    lines.append(f"Project type : {project_type if project_type else 'UNKNOWN'}")
+    lines.append(f"Entry point  : {entry if entry else 'NONE'}")
+    lines.append(f"Dependencies : {dependencies if dependencies else 'NONE'}")
+    lines.append("")
+    lines.append("Execution:")
+    lines.append("SANDBOX REQUIRED")
+    lines.append("NOT AVAILABLE IN V0.1")
+    lines.append("(Repository code is never downloaded or executed by M.C.O.)")
     return lines
 
 
@@ -877,10 +952,10 @@ def api_execute():
         return jsonify({"ok": False, "success": False, "error": "Too many requests. Please slow down."}), 429
 
     body = request.get_json(silent=True)
-    if not isinstance(body, dict) or "input" not in body:
+    if not isinstance(body, dict):
         return jsonify({"ok": False, "success": False, "error": "Invalid request body."}), 400
 
-    raw_input = str(body.get("input", ""))[:500]
+    raw_input = str(body.get("command", body.get("input", "")))[:500]
 
     try:
         cmd_name, output_lines = execute_command(raw_input)
