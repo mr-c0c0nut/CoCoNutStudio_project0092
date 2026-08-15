@@ -1,4 +1,9 @@
-Flask==3.0.3
-gunicorn==22.0.0
-requests==2.32.3
-psutil==6.0.0
+# M.C.O Local Agent dependencies.
+# The agent's HTTP layer uses only the Python standard library
+# (http.server) — psutil is optional but recommended for full
+# system/interface metrics.
+psutil>=5.9.0
+
+# Only needed to build mco-agent.exe with build_agent.bat.
+# Not required to just run mco_agent.py with `python mco_agent.py`.
+pyinstaller>=6.0.0
