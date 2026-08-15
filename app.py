@@ -2,6 +2,37 @@
 """
 M.C.O (Machine Command Operator) — web terminal backend.
 Language: COCOTHON v0.1
+
+=== CHANGES FOR THE WEB TERMINAL + LOCAL AGENT ARCHITECTURE ===
+
+This file is the Flask SERVER-SIDE backend only. It is unchanged in
+almost every respect from the original single-process design — all
+existing commands (check, run, hash, encode, json, search, system
+metrics, etc.) still work exactly as before, still executed here on
+the server, still safe (whitelisted, validated, no shell/eval).
+
+What's new is narrow and additive:
+
+  * LOCAL_COMMAND_NAMES — a plain set of command names that describe
+    the *user's own machine* (myip, interfaces, agentcpu, agentmemory,
+    agentdisk, agentuptime, agentsystem, agent, flushdns). These must
+    NEVER be answered by this server, because the server has no way
+    to see the user's local network/system — answering them here
+    would silently return the SERVER's info mislabeled as the user's,
+    which is exactly the confusion the new architecture is designed
+    to avoid.
+
+  * /api/execute now checks the command name against
+    LOCAL_COMMAND_NAMES *before* doing anything else. If it's a local
+    command, the server immediately replies with a small, explicit
+    marker (`"local_command": true`) telling the frontend to route it
+    to the Local Agent instead. The server does not attempt to execute
+    it, fake it, or approximate it in any way.
+
+  * Everything else (all server-side commands) flows through the exact
+    same `execute_command()` dispatcher as before.
+
+No existing endpoint, command, or behavior was removed.
 """
 
 import base64
@@ -175,8 +206,15 @@ def cmd_help(args, ctx):
         "json <file>",
         'search "term" <file>',
         "",
-        "[SYSTEM]",
+        "[SYSTEM — SERVER PROCESS]",
         "system", "cpu", "memory", "disk", "process", "uptime",
+        "",
+        "[LOCAL — YOUR MACHINE, requires Local Agent]",
+        "myip                          Your local network info",
+        "interfaces                    Your network interfaces",
+        "agent                         Local Agent connection status",
+        "agentsystem / agentcpu / agentmemory / agentdisk / agentuptime",
+        "flushdns                      Flush DNS cache (needs Administrator)",
         "",
         '(target argument may be omitted if "target" or an alias is set)',
     ]
@@ -191,8 +229,13 @@ def cmd_about(args, ctx):
         "M.C.O — a friendly web terminal for basic network diagnostics",
         "and small data utilities, built on the COCOTHON command language.",
         "",
-        "All commands run through a fixed whitelist on the server —",
-        "there is no arbitrary code or shell execution.",
+        "Server-side commands run through a fixed whitelist on this",
+        "Flask backend. Commands about YOUR machine (myip, interfaces,",
+        "system info) run through the M.C.O Local Agent on your PC —",
+        "see the 'agent' command.",
+        "",
+        "There is no arbitrary code or shell execution anywhere in",
+        "either the server or the Local Agent.",
     ]
 
 
@@ -499,14 +542,10 @@ GITHUB_RE_SHORT = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)$"
 )
 
-# Entry points, matched case-insensitively, priority order per language.
 PY_ENTRY_CANDIDATES = ["app.py", "main.py", "index.py", "run.py"]
 NODE_ENTRY_CANDIDATES = ["server.js", "app.js", "index.js"]
 WEB_ENTRY_CANDIDATES = ["index.html"]
 
-# Only these files count as dependency manifests. Anything else
-# (README, LICENSE, Procfile, runtime.txt, source files, ...) is
-# explicitly excluded, even if it looks dependency-related.
 DEPENDENCY_MANIFESTS = [
     "requirements.txt", "pyproject.toml", "pipfile", "pipfile.lock", "poetry.lock", "setup.py",
     "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
@@ -518,7 +557,7 @@ DEPENDENCY_MANIFESTS = [
 ]
 
 MAX_TREE_ITEMS_SHOWN = 40
-MAX_TREE_DEPTH = 3  # root (depth 1) + up to 2 nested levels
+MAX_TREE_DEPTH = 3
 
 
 def _parse_repo_ref(ref: str):
@@ -595,10 +634,7 @@ def _fetch_repo_tree(owner, repo, default_branch):
 
 
 def _build_project_tree_lines(tree_items):
-    """Render up to MAX_TREE_DEPTH levels deep, capped in item count.
-    Directories deeper than the cap are not expanded (their children
-    are simply omitted from the listing)."""
-    nodes = {}  # path -> {"type": blob|tree, "children": {}}
+    nodes = {}
     root = {"children": {}}
 
     def get_node(path_parts, container):
@@ -663,8 +699,6 @@ def _build_project_tree_lines(tree_items):
 
 
 def _find_ci(names_lower_map, candidates):
-    """Case-insensitive lookup against root-level filenames only.
-    Returns the ORIGINAL filename for the first matching candidate."""
     for candidate in candidates:
         original = names_lower_map.get(candidate.lower())
         if original:
@@ -703,8 +737,6 @@ def _detect_project(tree_items):
     elif web_entry:
         entry, project_type = web_entry, "Web"
 
-    # Dependency manifests: STRICT whitelist only. README/LICENSE/
-    # Procfile/runtime.txt/entry-point source files are never matched.
     found_manifests = []
     for candidate in DEPENDENCY_MANIFESTS:
         original = names_lower_map.get(candidate.lower())
@@ -887,50 +919,60 @@ def _uptime_str():
 
 def cmd_uptime(args, ctx):
     return [
-        "[UPTIME]", "",
+        "[UPTIME / SERVER PROCESS]", "",
         f"Application uptime: {_uptime_str()}",
         f"Server time (UTC) : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
-        "", "(Reflects this application process, not host system uptime.)",
+        "", "(Reflects this Flask application process, not your machine.",
+        " For your own machine's uptime, use: agentuptime)",
     ]
 
 
 def cmd_cpu(args, ctx):
     if not HAS_PSUTIL:
-        return ["[CPU]", "", "psutil is not installed — CPU metrics unavailable."]
+        return ["[CPU / SERVER PROCESS]", "", "psutil is not installed — CPU metrics unavailable."]
     percent = psutil.cpu_percent(interval=0.3)
     count = psutil.cpu_count(logical=True)
-    return ["[CPU]", "", f"Logical cores: {count}", f"Usage        : {percent}%"]
+    return [
+        "[CPU / SERVER PROCESS]", "",
+        f"Logical cores: {count}", f"Usage        : {percent}%",
+        "", "(This is the Flask SERVER's CPU, not your machine's.",
+        " For your own machine, use: agentcpu)",
+    ]
 
 
 def cmd_memory(args, ctx):
     if not HAS_PSUTIL:
-        return ["[MEMORY]", "", "psutil is not installed — memory metrics unavailable."]
+        return ["[MEMORY / SERVER PROCESS]", "", "psutil is not installed — memory metrics unavailable."]
     vm = psutil.virtual_memory()
     return [
-        "[MEMORY]", "",
+        "[MEMORY / SERVER PROCESS]", "",
         f"Total    : {vm.total // (1024 * 1024)} MB",
         f"Used     : {vm.used // (1024 * 1024)} MB",
         f"Available: {vm.available // (1024 * 1024)} MB",
         f"Usage    : {vm.percent}%",
+        "", "(This is the Flask SERVER's memory, not your machine's.",
+        " For your own machine, use: agentmemory)",
     ]
 
 
 def cmd_disk(args, ctx):
     if not HAS_PSUTIL:
-        return ["[DISK]", "", "psutil is not installed — disk metrics unavailable."]
+        return ["[DISK / SERVER PROCESS]", "", "psutil is not installed — disk metrics unavailable."]
     du = psutil.disk_usage("/")
     return [
-        "[DISK]", "",
+        "[DISK / SERVER PROCESS]", "",
         f"Total: {du.total // (1024 * 1024)} MB",
         f"Used : {du.used // (1024 * 1024)} MB",
         f"Free : {du.free // (1024 * 1024)} MB",
         f"Usage: {du.percent}%",
+        "", "(This is the Flask SERVER's disk, not your machine's.",
+        " For your own machine, use: agentdisk)",
     ]
 
 
 def cmd_process(args, ctx):
     pid = os.getpid()
-    lines = ["[PROCESS]", "", f"PID          : {pid}", f"Python       : {platform.python_version()}"]
+    lines = ["[PROCESS / SERVER]", "", f"PID          : {pid}", f"Python       : {platform.python_version()}"]
     if HAS_PSUTIL:
         try:
             p = psutil.Process(pid)
@@ -945,7 +987,7 @@ def cmd_process(args, ctx):
 
 def cmd_system(args, ctx):
     lines = [
-        "[SYSTEM]", "",
+        "[SYSTEM / SERVER PROCESS]", "",
         f"Platform  : {platform.system()} {platform.release()}",
         f"Python    : {platform.python_version()}",
         f"M.C.O     : v{MCO_VERSION}",
@@ -954,6 +996,8 @@ def cmd_system(args, ctx):
     if HAS_PSUTIL:
         lines.append(f"CPU usage : {psutil.cpu_percent(interval=0.2)}%")
         lines.append(f"Memory    : {psutil.virtual_memory().percent}%")
+    lines += ["", "(This describes the Flask SERVER, not your machine.",
+              " For your own machine, use: agentsystem)"]
     return lines
 
 
@@ -965,6 +1009,33 @@ COMMANDS = {
     "json": cmd_json, "search": cmd_search, "system": cmd_system,
     "cpu": cmd_cpu, "memory": cmd_memory, "disk": cmd_disk,
     "process": cmd_process, "uptime": cmd_uptime,
+}
+
+# ------------------------------------------------------------------
+# LOCAL commands: these describe the USER'S OWN MACHINE and must be
+# answered by the M.C.O Local Agent running on their PC, never by
+# this Flask server. The server has no visibility into the user's
+# local network interfaces or local system — it only ever sees its
+# own container/host. Listing these names here means /api/execute
+# can refuse to guess at them and instead tell the frontend to route
+# to the Local Agent (see api_execute() below).
+#
+# "agent" itself is included so the frontend consistently asks the
+# Local Agent for its own status rather than the server faking it.
+# "flushdns" is the one example admin-requiring operation — routed
+# to the Local Agent, which is solely responsible for the Windows
+# UAC confirmation flow (see agent/mco_agent.py).
+# ------------------------------------------------------------------
+LOCAL_COMMAND_NAMES = {
+    "myip",
+    "interfaces",
+    "agent",
+    "agentsystem",
+    "agentcpu",
+    "agentmemory",
+    "agentdisk",
+    "agentuptime",
+    "flushdns",
 }
 
 
@@ -1015,6 +1086,30 @@ def api_execute():
         return jsonify({"ok": False, "success": False, "error": "Invalid request body."}), 400
 
     raw_input = str(body.get("command", body.get("input", "")))[:500]
+
+    # --- NEW: local-agent routing check -------------------------------
+    # Parse just enough to get the command name, WITHOUT running any
+    # handler. If it's a local command, tell the frontend to talk to the
+    # Local Agent instead — the server never attempts to answer these
+    # itself (that would silently return the SERVER's own info as if it
+    # were the user's machine, which is exactly what this architecture
+    # exists to prevent). History still records what the user typed.
+    try:
+        probe_tokens = shlex.split(raw_input.strip()) if raw_input.strip() else []
+    except ValueError:
+        probe_tokens = []
+
+    if probe_tokens and probe_tokens[0].lower() in LOCAL_COMMAND_NAMES:
+        push_history(raw_input)
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "local_command": True,
+            "command": probe_tokens[0].lower(),
+            "args": probe_tokens[1:],
+            "output": [],
+        })
+    # --------------------------------------------------------------------
 
     try:
         cmd_name, output_lines = execute_command(raw_input)
