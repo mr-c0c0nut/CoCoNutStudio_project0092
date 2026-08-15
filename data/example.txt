@@ -1,0 +1,5 @@
+user: admin login success 192.168.1.20
+user: guest login failed 192.168.1.21
+admin panel accessed from 192.168.1.20
+service restarted by admin
+guest session expired

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M.C.O Terminal</title>
+<style>
+  :root {
+    --bg: #0b0d0f;
+    --panel: #101418;
+    --border: #1f2933;
+    --fg: #d7f7dc;
+    --fg-dim: #7c9a86;
+    --accent: #3ddc84;
+    --error: #ff6b6b;
+    --prompt: #3ddc84;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  .wrap {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 16px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+  }
+  header .title {
+    font-weight: bold;
+    color: var(--accent);
+    letter-spacing: 1px;
+  }
+  header .sub {
+    color: var(--fg-dim);
+    font-size: 12px;
+  }
+  .btns button {
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    margin-left: 6px;
+    font-family: inherit;
+    font-size: 12px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .btns button:hover { border-color: var(--accent); color: var(--accent); }
+
+  #screen {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .line-cmd { color: var(--fg); }
+  .line-cmd .prompt { color: var(--prompt); font-weight: bold; }
+  .line-out { color: var(--fg); margin: 2px 0 10px 0; }
+  .line-err { color: var(--error); margin: 2px 0 10px 0; }
+  .line-loading { color: var(--fg-dim); }
+
+  .inputRow {
+    display: flex;
+    align-items: center;
+    margin-top: 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .inputRow .prompt {
+    color: var(--prompt);
+    font-weight: bold;
+    margin-right: 8px;
+    white-space: nowrap;
+  }
+  .inputRow input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 14px;
+  }
+
+  footer {
+    text-align: center;
+    color: var(--fg-dim);
+    font-size: 11px;
+    margin-top: 8px;
+  }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="title">M.C.O Terminal</div>
+      <div class="sub">{{ version }} &middot; Diagnostics-only, sandboxed</div>
+    </div>
+    <div class="btns">
+      <button id="btnHelp">Help</button>
+      <button id="btnClear">Clear</button>
+    </div>
+  </header>
+
+  <div id="screen"></div>
+
+  <div class="inputRow">
+    <span class="prompt">MCO &gt;</span>
+    <input id="cmdInput" type="text" autocomplete="off" autofocus placeholder='Nhap lenh, vi du: check ping google.com' />
+  </div>
+
+  <footer>Type "help" to list commands &middot; Arrow Up/Down for history</footer>
+</div>
+
+<script>
+const screen = document.getElementById('screen');
+const input = document.getElementById('cmdInput');
+const btnClear = document.getElementById('btnClear');
+const btnHelp = document.getElementById('btnHelp');
+
+let history = [];
+let historyIndex = -1;
+
+function appendCommandLine(cmd) {
+  const div = document.createElement('div');
+  div.className = 'line-cmd';
+  div.innerHTML = '<span class="prompt">MCO &gt;</span> ' + escapeHtml(cmd);
+  screen.appendChild(div);
+}
+
+function appendOutput(text, isError) {
+  const div = document.createElement('div');
+  div.className = isError ? 'line-err' : 'line-out';
+  div.textContent = text;
+  screen.appendChild(div);
+  screen.scrollTop = screen.scrollHeight;
+}
+
+function appendLoading() {
+  const div = document.createElement('div');
+  div.className = 'line-loading';
+  div.textContent = 'running...';
+  screen.appendChild(div);
+  screen.scrollTop = screen.scrollHeight;
+  return div;
+}
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.innerText = str;
+  return d.innerHTML;
+}
+
+async function runCommand(cmd) {
+  appendCommandLine(cmd);
+  const loadingEl = appendLoading();
+
+  if (cmd.trim().toLowerCase() === 'clear') {
+    screen.innerHTML = '';
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: cmd })
+    });
+    const data = await resp.json();
+    loadingEl.remove();
+
+    if (data.output === '__CLEAR__') {
+      screen.innerHTML = '';
+      return;
+    }
+    appendOutput(data.output, !data.success);
+  } catch (e) {
+    loadingEl.remove();
+    appendOutput('Network error: could not reach server.', true);
+  }
+  screen.scrollTop = screen.scrollHeight;
+}
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const cmd = input.value;
+    if (!cmd.trim()) return;
+    history.push(cmd);
+    historyIndex = history.length;
+    input.value = '';
+    runCommand(cmd);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (historyIndex > 0) {
+      historyIndex--;
+      input.value = history[historyIndex];
+    }
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (historyIndex < history.length - 1) {
+      historyIndex++;
+      input.value = history[historyIndex];
+    } else {
+      historyIndex = history.length;
+      input.value = '';
+    }
+  }
+});
+
+btnClear.addEventListener('click', () => { screen.innerHTML = ''; input.focus(); });
+btnHelp.addEventListener('click', () => { input.value = 'help'; input.focus(); });
+
+appendOutput('M.C.O Terminal ready. Type "help" to begin.', false);
+input.focus();
+</script>
+</body>
+</html>
