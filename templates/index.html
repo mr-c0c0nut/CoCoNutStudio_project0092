@@ -73,7 +73,10 @@
   .output.error { color: #ff5555; }
   .output.network-error { color: #ff5555; }
   .output.running { color: #ffff66; }
+  .output.security { color: #ffcc33; }
   .dim { color: #1f7a1f; }
+  .agent-connected { color: #33ff33; }
+  .agent-disconnected { color: #ff5555; }
 
   form#inputRow {
     display: flex;
@@ -122,27 +125,28 @@
 ║   ╚═╝     ╚═╝   ╚═════╝    ╚═════╝                          ║
 ║                                                              ║
 ║   M.C.O v0.1 · COCOTHON TERMINAL                            ║
-║   Diagnostics-only · Sandboxed                               ║
+║   Web UI + Local Agent · Sandboxed                          ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝</div>
 
   <div class="toolbar">
     <button type="button" id="btnHelp">[ HELP ]</button>
     <button type="button" id="btnHistory">[ HISTORY ]</button>
+    <button type="button" id="btnAgent">[ AGENT ]</button>
     <button type="button" id="btnClear">[ CLEAR ]</button>
   </div>
 
   <div id="terminal">
     <div class="frame-top">┌─[ M.C.O ]</div>
     <div class="row dim">│</div>
-    <div class="row dim">│ M.C.O v0.1 · Diagnostics-only, sandboxed</div>
+    <div class="row dim">│ M.C.O v0.1 · Web UI + Local Agent architecture</div>
     <div class="row dim">│</div>
     <div class="row dim">├─[ SYSTEM ]</div>
-    <div class="row dim">│ Status : ONLINE</div>
-    <div class="row dim" id="backendStatusLine">│ Backend: CHECKING...</div>
+    <div class="row dim" id="backendStatusLine">│ Backend : CHECKING...</div>
+    <div class="row dim" id="agentStatusLine">│ Agent   : CHECKING...</div>
     <div class="frame-bottom">└─────────────────────────────────────────────────────────────</div>
     <div class="row dim">&nbsp;</div>
-    <div class="row dim">Type "help" to begin.</div>
+    <div class="row dim">Type "help" to begin. Type "agent" for Local Agent details.</div>
     <div class="row dim">&nbsp;</div>
   </div>
 
@@ -158,9 +162,32 @@
   var input = document.getElementById("cmdInput");
   var form = document.getElementById("inputRow");
   var backendStatusLine = document.getElementById("backendStatusLine");
+  var agentStatusLine = document.getElementById("agentStatusLine");
 
   var localHistory = [];
   var historyPos = -1;
+
+  // ------------------------------------------------------------------
+  // LOCAL AGENT connection state.
+  //
+  // The Agent is discovered via a small, fixed range of localhost ports
+  // (the packaged agent prints its actual port to its console window;
+  // for browser discovery we probe a short fixed list of common dev
+  // ports AND allow the user to set one explicitly with "agent port
+  // <n>" if they changed MCO_AGENT_PORT). This keeps discovery within
+  // the browser sandbox: we only ever fetch() 127.0.0.1, never a LAN
+  // address, and we never invoke any browser API that would reach
+  // outside the sandbox.
+  // ------------------------------------------------------------------
+  var AGENT_PROBE_PORTS = [17321, 18765, 5578, 8765];
+  var agentState = {
+    connected: false,
+    baseUrl: null,
+    token: null,
+    version: null,
+  };
+
+  var pendingSecurityConfirm = null; // { operation, resolve }
 
   function scrollToBottom() {
     terminal.scrollTop = terminal.scrollHeight;
@@ -198,7 +225,6 @@
   }
 
   function extractOutput(data) {
-    // Backend may return "output" as a string or an array of lines.
     var out = data && (data.output !== undefined ? data.output : data.error);
     if (Array.isArray(out)) return out.join("\n");
     if (out === undefined || out === null) return "";
@@ -212,9 +238,292 @@
     return false;
   }
 
+  // ------------------------------------------------------------------
+  // Local Agent discovery / calls.
+  //
+  // Every Agent call:
+  //   - targets only http://127.0.0.1:<port> (never any other host)
+  //   - sends the bearer token obtained at discovery time
+  //   - is a fixed, named path (/myip, /system, ...), never a path or
+  //     body built from raw user shell-like text.
+  // ------------------------------------------------------------------
+
+  async function tryAgentPort(port) {
+    try {
+      var resp = await fetch("http://127.0.0.1:" + port + "/health", { method: "GET" });
+      if (!resp.ok) return null;
+      var data = await resp.json();
+      return { port: port, version: data.version };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function discoverAgent() {
+    for (var i = 0; i < AGENT_PROBE_PORTS.length; i++) {
+      var found = await tryAgentPort(AGENT_PROBE_PORTS[i]);
+      if (found) {
+        agentState.connected = true;
+        agentState.baseUrl = "http://127.0.0.1:" + found.port;
+        agentState.version = found.version;
+        // NOTE: the health endpoint intentionally does not return the
+        // token (it requires no auth). The token itself is obtained
+        // via the local discovery file mechanism described in
+        // agent/README.md for a native companion extension; in this
+        // pure-browser build we ask the user to paste it once via the
+        // "agent token <value>" command if a protected endpoint is
+        // needed, since a web page cannot read local files from disk.
+        return true;
+      }
+    }
+    agentState.connected = false;
+    agentState.baseUrl = null;
+    return false;
+  }
+
+  function setAgentToken(token) {
+    agentState.token = token;
+  }
+
+  async function callAgent(path, body) {
+    if (!agentState.connected || !agentState.baseUrl) {
+      throw new Error("LOCAL AGENT REQUIRED");
+    }
+    var headers = { "Content-Type": "application/json" };
+    if (agentState.token) {
+      headers["Authorization"] = "Bearer " + agentState.token;
+    }
+    var resp = await fetch(agentState.baseUrl + path, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(body || {}),
+    });
+    var data = await resp.json();
+    if (resp.status === 401) {
+      throw new Error(
+        "Agent requires its token. Run: agent token <token-from-agent-console>"
+      );
+    }
+    if (!resp.ok) {
+      throw new Error((data && data.error) || ("Agent error (HTTP " + resp.status + ")"));
+    }
+    return data.result;
+  }
+
+  function refreshAgentStatusLine() {
+    if (agentState.connected) {
+      agentStatusLine.textContent = "│ Agent   : CONNECTED";
+      agentStatusLine.className = "row dim agent-connected";
+    } else {
+      agentStatusLine.textContent = "│ Agent   : NOT CONNECTED";
+      agentStatusLine.className = "row dim agent-disconnected";
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // LOCAL command handlers — one per whitelisted Agent capability.
+  // Nothing here builds a shell string; each is a fixed fetch() to a
+  // fixed Agent path.
+  // ------------------------------------------------------------------
+
+  async function handleLocalCommand(cmdName, cmdArgs) {
+    if (cmdName === "agent") {
+      if (cmdArgs[0] === "token" && cmdArgs[1]) {
+        setAgentToken(cmdArgs[1]);
+        return "Agent token set for this session.";
+      }
+      if (cmdArgs[0] === "refresh") {
+        await discoverAgent();
+        refreshAgentStatusLine();
+      }
+      var lines = ["MCO Local Agent", ""];
+      lines.push("Status     : " + (agentState.connected ? "CONNECTED" : "NOT CONNECTED"));
+      if (agentState.connected) {
+        lines.push("Address    : " + agentState.baseUrl);
+        lines.push("Version    : " + (agentState.version || "unknown"));
+        lines.push("Capabilities:");
+        lines.push("  - local network (myip, interfaces)");
+        lines.push("  - system information (agentsystem, agentcpu, agentmemory, agentdisk, agentuptime)");
+        lines.push("  - diagnostics");
+        lines.push("  - flushdns (requires Administrator via Windows UAC)");
+        if (!agentState.token) {
+          lines.push("");
+          lines.push("(No token set yet — some endpoints will ask for one.");
+          lines.push(" Run: agent token <token-shown-in-agent-console-window>)");
+        }
+      } else {
+        lines.push("");
+        lines.push("Run mco-agent.exe on this PC, then: agent refresh");
+      }
+      return lines.join("\n");
+    }
+
+    if (!agentState.connected) {
+      throw new Error("LOCAL AGENT REQUIRED");
+    }
+
+    if (cmdName === "myip") {
+      var r = await callAgent("/myip", {});
+      var out = ["[MYIP / LOCAL AGENT]", "", "Hostname : " + r.hostname];
+      out.push("Local IPv4 : " + (r.local_ipv4.length ? r.local_ipv4.join(", ") : "(none)"));
+      if (r.local_ipv6 && r.local_ipv6.length) {
+        out.push("Local IPv6 : " + r.local_ipv6.join(", "));
+      }
+      out.push("");
+      out.push("Source: " + r.source);
+      out.push(r.note);
+      return out.join("\n");
+    }
+
+    if (cmdName === "interfaces") {
+      var r2 = await callAgent("/interfaces", {});
+      var out2 = ["[INTERFACES / LOCAL AGENT]", ""];
+      r2.interfaces.forEach(function (iface) {
+        out2.push(iface.name + "  [" + iface.status + "]");
+        iface.addresses.forEach(function (a) {
+          out2.push("  " + a.family + ": " + a.address);
+        });
+      });
+      return out2.join("\n");
+    }
+
+    if (cmdName === "agentsystem") {
+      var r3 = await callAgent("/system", {});
+      return [
+        "[SYSTEM / LOCAL AGENT]", "",
+        "OS       : " + r3.os + " " + r3.os_release,
+        "Version  : " + r3.os_version,
+        "Machine  : " + r3.machine,
+        "Python   : " + r3.python,
+        "Agent    : v" + r3.agent_version,
+      ].join("\n");
+    }
+
+    if (cmdName === "agentcpu") {
+      var r4 = await callAgent("/cpu", {});
+      return [
+        "[CPU / LOCAL AGENT]", "",
+        "Logical cores : " + r4.logical_cores,
+        "Physical cores: " + r4.physical_cores,
+        "Usage         : " + r4.usage_percent + "%",
+      ].join("\n");
+    }
+
+    if (cmdName === "agentmemory") {
+      var r5 = await callAgent("/memory", {});
+      return [
+        "[MEMORY / LOCAL AGENT]", "",
+        "Total    : " + r5.total_mb + " MB",
+        "Used     : " + r5.used_mb + " MB",
+        "Available: " + r5.available_mb + " MB",
+        "Usage    : " + r5.usage_percent + "%",
+      ].join("\n");
+    }
+
+    if (cmdName === "agentdisk") {
+      var r6 = await callAgent("/disk", {});
+      return [
+        "[DISK / LOCAL AGENT]", "",
+        "Drive: " + r6.drive,
+        "Total: " + r6.total_mb + " MB",
+        "Used : " + r6.used_mb + " MB",
+        "Free : " + r6.free_mb + " MB",
+        "Usage: " + r6.usage_percent + "%",
+      ].join("\n");
+    }
+
+    if (cmdName === "agentuptime") {
+      var r7 = await callAgent("/uptime", {});
+      return "[UPTIME / LOCAL AGENT]\n\nSystem uptime: " + r7.system_uptime;
+    }
+
+    if (cmdName === "flushdns") {
+      return await runAdminOperationFlow("flush_dns_admin");
+    }
+
+    throw new Error("Unknown local command: " + cmdName);
+  }
+
+  // ------------------------------------------------------------------
+  // Windows UAC confirmation flow.
+  //
+  // Step 1: ask the Agent to DESCRIBE the operation (confirm=false).
+  //         The Agent does NOT touch the system at this point.
+  // Step 2: show a [ SECURITY REQUEST ] block and wait for the user to
+  //         type y/N at the normal MCO > prompt.
+  // Step 3: only on "y", call the Agent again with confirm=true. THIS
+  //         is what makes the Agent trigger the real Windows UAC
+  //         dialog. "y" is never treated as elevation itself.
+  // Step 4: report the real result — including if Windows/the user
+  //         denied the UAC prompt. Never claim success unless the
+  //         Agent reported granted=true.
+  // ------------------------------------------------------------------
+  async function runAdminOperationFlow(operationName) {
+    var description = await callAgent("/admin-operation", {
+      operation: operationName,
+      confirm: false,
+    });
+
+    addFramedBlock(
+      "SECURITY REQUEST",
+      "This operation requires Administrator privileges.\n\n" +
+      "Operation:\n" + description.description + "\n\n" +
+      "The Windows UAC prompt will appear next.\n" +
+      "Continue? [y/N]",
+      "output security"
+    );
+
+    var answer = await new Promise(function (resolve) {
+      pendingSecurityConfirm = { resolve: resolve };
+    });
+
+    if (answer !== "y") {
+      return "OPERATION CANCELLED";
+    }
+
+    var result = await callAgent("/admin-operation", {
+      operation: operationName,
+      confirm: true,
+    });
+
+    if (!result.granted) {
+      return "OPERATION CANCELLED\nAdministrator permission was not granted.\n(" + result.detail + ")";
+    }
+    return "Operation completed with Administrator privileges.\n(" + result.detail + ")";
+  }
+
+  // ------------------------------------------------------------------
+  // Main command runner.
+  // ------------------------------------------------------------------
+
+  var LOCAL_COMMAND_NAMES = [
+    "myip", "interfaces", "agent",
+    "agentsystem", "agentcpu", "agentmemory", "agentdisk", "agentuptime",
+    "flushdns",
+  ];
+
+  function splitCommand(raw) {
+    // Minimal tokenizer good enough for routing decisions in the UI
+    // (the server does the authoritative parsing for server commands;
+    // this only needs to recognize the leading command word and,
+    // for local commands, simple space-separated args/flags).
+    var parts = raw.trim().split(/\s+/);
+    return { name: (parts[0] || "").toLowerCase(), args: parts.slice(1) };
+  }
+
   async function runCommand(raw) {
     var trimmed = raw.trim();
     if (!trimmed) return;
+
+    // If we're mid security-confirmation, this input is the y/N answer,
+    // not a new command.
+    if (pendingSecurityConfirm) {
+      echoCommand(trimmed);
+      var resolve = pendingSecurityConfirm.resolve;
+      pendingSecurityConfirm = null;
+      resolve(trimmed.toLowerCase());
+      return;
+    }
 
     echoCommand(trimmed);
     localHistory.push(trimmed);
@@ -226,8 +535,27 @@
       return;
     }
 
-    var runningRow = addRow("Running...", "output running");
+    var parsed = splitCommand(trimmed);
 
+    if (LOCAL_COMMAND_NAMES.indexOf(parsed.name) !== -1) {
+      var runningRow = addRow("Running...", "output running");
+      try {
+        var text = await handleLocalCommand(parsed.name, parsed.args);
+        runningRow.remove();
+        addRow(text, "output");
+      } catch (err) {
+        runningRow.remove();
+        if (String(err.message) === "LOCAL AGENT REQUIRED") {
+          addRow("LOCAL AGENT REQUIRED", "output error");
+        } else {
+          addFramedBlock("ERROR", err.message || String(err), "output error");
+        }
+      }
+      return;
+    }
+
+    // Otherwise: server command via Flask /api/execute.
+    var runningRow2 = addRow("Running...", "output running");
     try {
       var resp = await fetch("/api/execute", {
         method: "POST",
@@ -239,12 +567,32 @@
       try {
         data = await resp.json();
       } catch (parseErr) {
-        runningRow.remove();
+        runningRow2.remove();
         addFramedBlock("M.C.O / NETWORK", "Backend connection failed.", "output network-error");
         return;
       }
 
-      runningRow.remove();
+      runningRow2.remove();
+
+      // Defensive: if a future server version ever reports a command
+      // as local (e.g. if the client-side whitelist above drifts from
+      // the server's), route it instead of misreporting server output.
+      if (data && data.local_command) {
+        var rerunRow = addRow("Running...", "output running");
+        try {
+          var text2 = await handleLocalCommand(data.command, data.args || []);
+          rerunRow.remove();
+          addRow(text2, "output");
+        } catch (err2) {
+          rerunRow.remove();
+          if (String(err2.message) === "LOCAL AGENT REQUIRED") {
+            addRow("LOCAL AGENT REQUIRED", "output error");
+          } else {
+            addFramedBlock("ERROR", err2.message || String(err2), "output error");
+          }
+        }
+        return;
+      }
 
       var outputText = extractOutput(data);
 
@@ -254,7 +602,7 @@
         addFramedBlock("ERROR", outputText || "Unknown error.", "output error");
       }
     } catch (err) {
-      runningRow.remove();
+      runningRow2.remove();
       addFramedBlock("M.C.O / NETWORK", "Backend connection failed.", "output network-error");
     }
   }
@@ -265,6 +613,8 @@
     input.value = "";
     runCommand(val);
   });
+
+  var currentAbortController = null;
 
   input.addEventListener("keydown", function (e) {
     if (e.key === "ArrowUp") {
@@ -283,11 +633,23 @@
     } else if (e.key === "l" && e.ctrlKey) {
       e.preventDefault();
       clearTerminal();
+    } else if (e.key === "c" && e.ctrlKey) {
+      // Best-effort: cancel a pending security confirmation, since that
+      // is the only long-lived "operation" this UI can meaningfully
+      // interrupt without a real process to signal.
+      if (pendingSecurityConfirm) {
+        e.preventDefault();
+        var resolve = pendingSecurityConfirm.resolve;
+        pendingSecurityConfirm = null;
+        addRow("^C", "dim");
+        resolve("n");
+      }
     }
   });
 
   document.getElementById("btnHelp").addEventListener("click", function () { runCommand("help"); });
   document.getElementById("btnHistory").addEventListener("click", function () { runCommand("history"); });
+  document.getElementById("btnAgent").addEventListener("click", function () { runCommand("agent"); });
   document.getElementById("btnClear").addEventListener("click", function () { clearTerminal(); });
 
   document.addEventListener("click", function () { input.focus(); });
@@ -296,16 +658,22 @@
     try {
       var resp = await fetch("/api/health");
       if (resp.ok) {
-        backendStatusLine.textContent = "│ Backend: CONNECTED";
+        backendStatusLine.textContent = "│ Backend : CONNECTED";
       } else {
-        backendStatusLine.textContent = "│ Backend: ERROR";
+        backendStatusLine.textContent = "│ Backend : ERROR";
       }
     } catch (e) {
-      backendStatusLine.textContent = "│ Backend: DISCONNECTED";
+      backendStatusLine.textContent = "│ Backend : DISCONNECTED";
     }
   }
 
-  checkHealth();
+  async function init() {
+    await checkHealth();
+    await discoverAgent();
+    refreshAgentStatusLine();
+  }
+
+  init();
   input.focus();
 })();
 </script>
