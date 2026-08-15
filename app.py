@@ -499,14 +499,26 @@ GITHUB_RE_SHORT = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)$"
 )
 
-# Case-insensitive entry point candidates, in priority order per language.
-PY_ENTRY_CANDIDATES = ["app.py", "main.py", "run.py", "index.py"]
-NODE_ENTRY_CANDIDATES = ["server.js", "index.js", "app.js"]
+# Entry points, matched case-insensitively, priority order per language.
+PY_ENTRY_CANDIDATES = ["app.py", "main.py", "index.py", "run.py"]
+NODE_ENTRY_CANDIDATES = ["server.js", "app.js", "index.js"]
 WEB_ENTRY_CANDIDATES = ["index.html"]
 
-MARKER_FILES = ["requirements.txt", "package.json", "runtime.txt", "procfile", "readme.md"]
+# Only these files count as dependency manifests. Anything else
+# (README, LICENSE, Procfile, runtime.txt, source files, ...) is
+# explicitly excluded, even if it looks dependency-related.
+DEPENDENCY_MANIFESTS = [
+    "requirements.txt", "pyproject.toml", "pipfile", "pipfile.lock", "poetry.lock", "setup.py",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "gemfile", "gemfile.lock",
+    "composer.json", "composer.lock",
+    "cargo.toml", "cargo.lock",
+    "go.mod", "go.sum",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+]
 
 MAX_TREE_ITEMS_SHOWN = 40
+MAX_TREE_DEPTH = 3  # root (depth 1) + up to 2 nested levels
 
 
 def _parse_repo_ref(ref: str):
@@ -551,9 +563,6 @@ def _github_get(url, timeout=GITHUB_TIMEOUT, params=None):
 
 
 def _fetch_repo_tree(owner, repo, default_branch):
-    """Fetch the recursive tree (single API call) and return the raw
-    list of tree items, or [] on any non-fatal failure. Discovery must
-    never fail the whole RUN command just because the tree is unreadable."""
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}"
     try:
         resp = requests.get(
@@ -586,44 +595,76 @@ def _fetch_repo_tree(owner, repo, default_branch):
 
 
 def _build_project_tree_lines(tree_items):
-    """Render a shallow, readable tree: root-level files plus top-level
-    directories (marked with a trailing slash), sorted dirs-last-alpha
-    then files-alpha, capped to keep output terminal-friendly."""
-    root_files = []
-    root_dirs = set()
+    """Render up to MAX_TREE_DEPTH levels deep, capped in item count.
+    Directories deeper than the cap are not expanded (their children
+    are simply omitted from the listing)."""
+    nodes = {}  # path -> {"type": blob|tree, "children": {}}
+    root = {"children": {}}
 
-    for item in tree_items:
-        if not isinstance(item, dict):
-            continue
-        path = item.get("path") or ""
-        item_type = item.get("type")
-        if not path:
-            continue
-        if "/" not in path:
-            if item_type == "blob":
-                root_files.append(path)
-            elif item_type == "tree":
-                root_dirs.add(path)
-        else:
-            root_dirs.add(path.split("/", 1)[0])
+    def get_node(path_parts, container):
+        node = container
+        for i, part in enumerate(path_parts):
+            depth = i + 1
+            if depth > MAX_TREE_DEPTH:
+                return None
+            node = node["children"].setdefault(part, {"type": "tree", "children": {}})
+        return node
 
-    entries = sorted(root_files, key=str.lower) + [d + "/" for d in sorted(root_dirs, key=str.lower)]
-    truncated = len(entries) > MAX_TREE_ITEMS_SHOWN
-    entries = entries[:MAX_TREE_ITEMS_SHOWN]
+    entries_sorted = sorted(
+        [it for it in tree_items if isinstance(it, dict) and it.get("path")],
+        key=lambda it: it["path"].lower(),
+    )
+
+    for item in entries_sorted:
+        path = item["path"]
+        parts = path.split("/")
+        if len(parts) > MAX_TREE_DEPTH:
+            continue
+        parent_parts, name = parts[:-1], parts[-1]
+        parent = get_node(parent_parts, root) if parent_parts else root
+        if parent is None:
+            continue
+        parent["children"][name] = {
+            "type": "tree" if item.get("type") == "tree" else "blob",
+            "children": parent["children"].get(name, {}).get("children", {}),
+        }
 
     lines = []
-    for i, entry in enumerate(entries):
-        is_last = (i == len(entries) - 1) and not truncated
-        branch = "└── " if is_last else "├── "
-        lines.append(branch + entry)
-    if truncated:
-        lines.append("└── ... (truncated)")
+    total_shown = [0]
+    truncated = [False]
+
+    def render(node, prefix=""):
+        items = sorted(
+            node["children"].items(),
+            key=lambda kv: (kv[1]["type"] != "tree", kv[0].lower()),
+        )
+        for i, (name, child) in enumerate(items):
+            if total_shown[0] >= MAX_TREE_ITEMS_SHOWN:
+                truncated[0] = True
+                return
+            is_last = i == len(items) - 1
+            branch = "└── " if is_last else "├── "
+            label = name + ("/" if child["type"] == "tree" else "")
+            lines.append(prefix + branch + label)
+            total_shown[0] += 1
+            if child["type"] == "tree" and child["children"]:
+                next_prefix = prefix + ("    " if is_last else "│   ")
+                render(child, next_prefix)
+
+    render(root)
+
+    total_items_in_repo = len(tree_items)
+    if truncated[0] or total_items_in_repo > total_shown[0]:
+        remaining = max(total_items_in_repo - total_shown[0], 0)
+        if remaining > 0:
+            lines.append(f"... and {remaining} more files")
+
     return lines
 
 
 def _find_ci(names_lower_map, candidates):
-    """Case-insensitive lookup: return the ORIGINAL filename as it
-    appears in the repo for the first matching candidate, or None."""
+    """Case-insensitive lookup against root-level filenames only.
+    Returns the ORIGINAL filename for the first matching candidate."""
     for candidate in candidates:
         original = names_lower_map.get(candidate.lower())
         if original:
@@ -632,8 +673,6 @@ def _find_ci(names_lower_map, candidates):
 
 
 def _detect_project(tree_items):
-    """Inspect root-level blobs (case-insensitively) and determine
-    entry point, project type, and dependency marker file."""
     names_lower_map = {}
     for item in tree_items:
         if not isinstance(item, dict):
@@ -649,20 +688,30 @@ def _detect_project(tree_items):
     node_entry = _find_ci(names_lower_map, NODE_ENTRY_CANDIDATES)
     has_package_json = "package.json" in names_lower_map
     web_entry = _find_ci(names_lower_map, WEB_ENTRY_CANDIDATES)
+    has_cargo = "cargo.toml" in names_lower_map
+    has_go_mod = "go.mod" in names_lower_map
 
     if py_entry:
         entry, project_type = py_entry, "Python"
     elif node_entry or has_package_json:
-        entry = node_entry or names_lower_map.get("package.json")
+        entry = node_entry
         project_type = "Node.js"
+    elif has_cargo:
+        project_type = "Rust"
+    elif has_go_mod:
+        project_type = "Go"
     elif web_entry:
-        entry, project_type = web_entry, "Web (static HTML)"
+        entry, project_type = web_entry, "Web"
 
-    dependencies = _find_ci(names_lower_map, MARKER_FILES[:2])  # requirements.txt / package.json
-    if not dependencies:
-        dependencies = _find_ci(names_lower_map, MARKER_FILES)
+    # Dependency manifests: STRICT whitelist only. README/LICENSE/
+    # Procfile/runtime.txt/entry-point source files are never matched.
+    found_manifests = []
+    for candidate in DEPENDENCY_MANIFESTS:
+        original = names_lower_map.get(candidate.lower())
+        if original and original not in found_manifests:
+            found_manifests.append(original)
 
-    return entry, project_type, dependencies
+    return entry, project_type, found_manifests
 
 
 def cmd_run(args, ctx):
@@ -708,7 +757,7 @@ def cmd_run(args, ctx):
 
     tree_items = _fetch_repo_tree(owner, repo, default_branch)
     tree_lines = _build_project_tree_lines(tree_items) if tree_items else []
-    entry, project_type, dependencies = _detect_project(tree_items) if tree_items else (None, None, None)
+    entry, project_type, dependencies = _detect_project(tree_items) if tree_items else (None, None, [])
 
     lines = [
         "[ M.C.O / RUN / DISCOVERY ]", "",
@@ -726,9 +775,19 @@ def cmd_run(args, ctx):
         lines.append("Project tree: (unavailable — could not read repository contents)")
         lines.append("")
 
-    lines.append(f"Project type : {project_type if project_type else 'UNKNOWN'}")
+    lines.append(f"Project type : {project_type if project_type else 'Unknown'}")
     lines.append(f"Entry point  : {entry if entry else 'NONE'}")
-    lines.append(f"Dependencies : {dependencies if dependencies else 'NONE'}")
+
+    if not dependencies:
+        lines.append("Dependencies : NONE")
+    elif len(dependencies) == 1:
+        lines.append(f"Dependencies : {dependencies[0]}")
+    else:
+        lines.append("Dependencies :")
+        for i, dep in enumerate(dependencies):
+            branch = "└── " if i == len(dependencies) - 1 else "├── "
+            lines.append(f"{branch}{dep}")
+
     lines.append("")
     lines.append("Execution:")
     lines.append("SANDBOX REQUIRED")
